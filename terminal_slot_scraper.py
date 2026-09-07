@@ -7,7 +7,17 @@ Supported terminals:
   - TruckGate  : Hamburg TruckGate — React SPA, one day at a time
 
 Each terminal is processed independently. A failure in one does not abort others.
-The run exits 1 only if at least one terminal failed.
+The run exits 1 only if at least one terminal had a genuine TECHNICAL failure
+(page didn't load, expected DOM structure missing entirely, upload error, etc).
+
+IMPORTANT — zero slots is a result, not a failure:
+The whole point of this scrape is to catch the moments a terminal has NO open
+appointment slots, so BuyCo can crossbill the terminal for missing appointments.
+A terminal that is fully booked will legitimately show 0 (or very few) rows.
+That is exactly the data we're here to capture, so it must always be written
+to Drive (CSV + screenshot) and reported in the summary — never treated as a
+scraper failure. Only raise/fail when the page itself is broken (wrong
+structure, missing elements we rely on to parse at all), not when it's empty.
 """
 import csv
 import io
@@ -36,7 +46,9 @@ TERMINALS = [
             "https://www.rdvgmp.fr/static/calendar_tdf.html",
             "https://www.rdvgmp.fr/static/calendar_tdf_next_week.html",
         ],
-        "min_rows": 10,
+        # Informational only — see "low_row_watermark" note below. A fully
+        # booked week can legitimately show far fewer than this.
+        "low_row_watermark": 10,
     },
     {
         "slug": "gct_deltaport",
@@ -44,7 +56,7 @@ TERMINALS = [
         "type": "gct",
         "file_prefix": "GCT_Deltaport",
         "url": "https://webservices.globalterminals.com/tsiWebServiceClient/ReservationAvailabilityStatus.jsp?terminal=DELTAPORT",
-        "min_rows": 5,
+        "low_row_watermark": 5,
     },
     {
         "slug": "gct_vanterm",
@@ -52,7 +64,7 @@ TERMINALS = [
         "type": "gct",
         "file_prefix": "GCT_Vanterm",
         "url": "https://webservices.globalterminals.com/tsiWebServiceClient/ReservationAvailabilityStatus.jsp?terminal=VANTERM",
-        "min_rows": 5,
+        "low_row_watermark": 5,
     },
     {
         "slug": "truckgate_hamburg",
@@ -65,12 +77,19 @@ TERMINALS = [
             "Eurogate CTH", "Eurogate EKOM", "EUROGATE CTB", "EUROGATE CTW",
             "HHLA CTA", "HHLA CTB", "HHLA CTT",
         ],
-        # No row-count floor: TruckGate legitimately has days with very few
-        # (or zero) open slots, so a minimum here would fail on real data,
-        # not just on broken parsing. Removed at user's request.
-        "min_rows": 0,
+        # TruckGate legitimately has days with very few (or zero) open
+        # slots, so no watermark is set for it.
+        "low_row_watermark": 0,
     },
 ]
+
+# "low_row_watermark" is NOT a pass/fail gate. It never aborts the run —
+# it only controls whether a terminal gets flagged with a ⚠ in the log/summary
+# so a human can glance at "did this terminal look unusually empty today"
+# without it ever blocking the CSV/screenshot from being uploaded. Zero rows
+# is the single most important result this scraper can produce (it's the
+# crossbilling signal), so it must never be suppressed or turned into a
+# failure.
 
 # Known GCT column order (server-rendered JSP, stable format)
 GCT_HEADERS = [
@@ -248,10 +267,30 @@ def process_gct(terminal: dict, browser, today_str: str):
         png_bytes,
     )]
 
-    if not table_data or len(table_data) < 3:
-        raise RuntimeError("GCT table not found or fewer than 3 rows returned")
+    if not table_data:
+        # No <table> element at all — the page genuinely failed to render
+        # (down, blocked, redesigned). This is a real technical failure.
+        raise RuntimeError(
+            "GCT table not found in page — page failed to load or its "
+            "structure has changed (this is a parsing problem, not a "
+            "zero-availability result)"
+        )
 
-    # Rows 0–1 are double-labeled headers; data starts at row 2
+    if len(table_data) < 2:
+        # Even the two header rows are missing/incomplete — the table that
+        # *is* there isn't the reservation table we know how to read. Still
+        # a technical failure, not "zero slots".
+        raise RuntimeError(
+            f"GCT table found but malformed ({len(table_data)} row(s), "
+            "expected at least the 2 header rows) — likely a page-structure "
+            "change, not a zero-availability result"
+        )
+
+    # Rows 0–1 are the double-labeled headers; data starts at row 2.
+    # If nothing follows the headers, that's a legitimate result: the
+    # terminal has zero open slots right now (fully booked) — exactly the
+    # condition we're scraping for, so it flows through as 0 rows rather
+    # than raising.
     data_rows = [row for row in table_data[2:] if any(cell.strip() for cell in row)]
 
     # Align each row to the known GCT_HEADERS length
@@ -346,8 +385,10 @@ def process_truckgate(terminal: dict, browser, today_str: str):
 # Terminal dispatcher
 # ---------------------------------------------------------------------------
 
-def process_terminal(terminal: dict, browser, svc, folder_id: str, today_str: str) -> int:
-    """Process one terminal end-to-end. Raises RuntimeError on any failure."""
+def process_terminal(terminal: dict, browser, svc, folder_id: str, today_str: str) -> dict:
+    """Process one terminal end-to-end. Raises RuntimeError on a genuine
+    technical failure only. Returns {"rows": int, "zero_availability": bool}
+    on success — a 0-row result is a success, not an error."""
     slug  = terminal["slug"]
     label = terminal["label"]
     ttype = terminal.get("type", "tdf")
@@ -362,11 +403,19 @@ def process_terminal(terminal: dict, browser, svc, folder_id: str, today_str: st
     else:
         raise RuntimeError(f"Unknown terminal type: {ttype!r}")
 
-    if len(rows) < terminal.get("min_rows", 1):
-        raise RuntimeError(
-            f"Only {len(rows)} rows parsed (minimum {terminal['min_rows']}) — "
-            "page layout may have changed."
-        )
+    # Zero (or unusually low) rows is NEVER a failure here — it's the
+    # crossbilling signal this whole scrape exists to catch. We still flag
+    # it in the logs/summary so it's easy to spot, but the CSV and
+    # screenshot are always uploaded regardless of the row count.
+    watermark = terminal.get("low_row_watermark", 0)
+    zero_availability = len(rows) == 0
+    if zero_availability:
+        print(f"    ⚠ 0 slots parsed — {label} appears fully booked "
+              "(no open appointments). Recording as zero-availability, "
+              "not a failure.")
+    elif len(rows) < watermark:
+        print(f"    ⚠ Only {len(rows)} rows parsed (below the usual "
+              f"~{watermark}) — low availability today; uploading as-is.")
 
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -383,7 +432,7 @@ def process_terminal(terminal: dict, browser, svc, folder_id: str, today_str: st
         upload_file(name, png_bytes, "image/png", svc, folder_id, verify=False)
 
     print(f"  ✓ {slug}: {len(rows)} rows + {len(screenshots)} screenshot(s) uploaded.")
-    return len(rows)
+    return {"rows": len(rows), "zero_availability": zero_availability}
 
 
 # ---------------------------------------------------------------------------
@@ -403,13 +452,16 @@ def main():
     svc = build("drive", "v3", credentials=creds)
 
     failures = []
+    zero_availability = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch()
         try:
             for terminal in TERMINALS:
                 try:
-                    process_terminal(terminal, browser, svc, folder_id, today_str)
+                    result = process_terminal(terminal, browser, svc, folder_id, today_str)
+                    if result["zero_availability"]:
+                        zero_availability.append(terminal["slug"])
                 except Exception as exc:
                     msg = f"{terminal['slug']}: {exc}"
                     print(f"\n  ✗ FAILED — {msg}")
@@ -422,8 +474,13 @@ def main():
     print(f"  Succeeded : {len(TERMINALS) - len(failures)}")
     print(f"  Failed    : {len(failures)}")
 
+    if zero_availability:
+        print(f"\nZero availability today (possible crossbill candidates):")
+        for slug in zero_availability:
+            print(f"  • {slug}")
+
     if failures:
-        print("\nFailures:")
+        print("\nFailures (technical — page/parsing broke, not a slots result):")
         for f in failures:
             print(f"  • {f}")
         sys.exit(1)
