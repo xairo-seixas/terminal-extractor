@@ -18,6 +18,11 @@ That is exactly the data we're here to capture, so it must always be written
 to Drive (CSV + screenshot) and reported in the summary — never treated as a
 scraper failure. Only raise/fail when the page itself is broken (wrong
 structure, missing elements we rely on to parse at all), not when it's empty.
+
+When a GCT terminal DOES hit a genuine technical failure (no table found /
+malformed table), the screenshot and a page HTML + HTTP-status snapshot are
+still uploaded to Drive, named with a "_FAILED_" marker, so the failure can
+be diagnosed by looking in Drive rather than needing to re-run the job.
 """
 import csv
 import io
@@ -122,13 +127,15 @@ CAPACITY   = re.compile(
 # ---------------------------------------------------------------------------
 
 def open_page(url: str, browser, extra_wait_ms: int = 0):
-    """Navigate to a URL; return (page, png_bytes). Caller must close page."""
+    """Navigate to a URL; return (page, png_bytes, response). Caller must
+    close page. `response` is the main-frame navigation Response (has
+    .status / .status_text) or None if Playwright didn't get one."""
     page = browser.new_page()
-    page.goto(url, wait_until="networkidle", timeout=60_000)
+    response = page.goto(url, wait_until="networkidle", timeout=60_000)
     if extra_wait_ms:
         page.wait_for_timeout(extra_wait_ms)
     png_bytes = page.screenshot(full_page=True)
-    return page, png_bytes
+    return page, png_bytes, response
 
 
 def upload_file(filename: str, data: bytes, mimetype: str, svc, folder_id: str,
@@ -202,7 +209,7 @@ def process_tdf(terminal: dict, browser, today_str: str):
 
     for url in terminal["urls"]:
         print(f"    Fetching {url}")
-        page, png_bytes = open_page(url, browser)
+        page, png_bytes, _resp = open_page(url, browser)
         try:
             html = page.content()
         finally:
@@ -238,59 +245,141 @@ def process_tdf(terminal: dict, browser, today_str: str):
 # GCT parser (Vancouver — server-rendered HTML table)
 # ---------------------------------------------------------------------------
 
-def process_gct(terminal: dict, browser, today_str: str):
+def _upload_gct_failure_diagnostics(
+    svc, folder_id: str, prefix: str, today_str: str, url: str,
+    status, status_text, title: str, html: str, png_bytes: bytes,
+):
+    """Best-effort: when GCT parsing fails, upload the screenshot plus an
+    HTTP-status/title/HTML snapshot to Drive so the failure can be
+    diagnosed without re-running the job or SSHing into CI. Uses a
+    "_FAILED_" filename so it never collides with (or gets mistaken for) a
+    real successful-day screenshot. Never lets a problem uploading
+    diagnostics mask the real parsing failure the caller is about to raise.
+    """
+    try:
+        upload_file(
+            f"{prefix}_terminal_screenshot_FAILED_{today_str}.png",
+            png_bytes, "image/png", svc, folder_id, verify=False,
+        )
+
+        html_cap = 200_000
+        html_out = html if len(html) <= html_cap else (
+            html[:html_cap] + f"\n\n... [truncated, {len(html):,} chars total]"
+        )
+        debug_text = (
+            f"URL: {url}\n"
+            f"Timestamp (Europe/Paris): "
+            f"{datetime.now(ZoneInfo('Europe/Paris')).isoformat()}\n"
+            f"HTTP status: {status} {status_text or ''}\n"
+            f"Page title: {title!r}\n"
+            f"HTML length: {len(html):,} chars\n"
+            f"{'-' * 70}\n"
+            f"{html_out}\n"
+        )
+        upload_file(
+            f"{prefix}_terminal_debug_FAILED_{today_str}.html",
+            debug_text.encode("utf-8"), "text/html", svc, folder_id, verify=False,
+        )
+        print("    (uploaded failure screenshot + HTML/status snapshot for diagnosis)")
+    except Exception as diag_exc:
+        print(f"    (could not upload failure diagnostics: {diag_exc})")
+
+
+# When GCT has nothing to reserve (terminal closed / fully booked for the
+# window queried), it doesn't render the table at all — it renders a plain
+# status banner reading "result: reservationInfoXmlList: Empty 0:" instead.
+# That is GCT's own explicit "no availability" signal, confirmed against
+# https://globalterminals.com/terminal-operations/gate-schedule/ , so it must
+# be treated as a real zero-slots result, not a parsing failure.
+GCT_NO_DATA_RE = re.compile(r"reservationInfoXmlList\s*:\s*Empty\s*0", re.I)
+
+
+def process_gct(terminal: dict, browser, today_str: str, svc, folder_id: str):
     """Returns (headers, rows, screenshots_list)."""
     url = terminal["url"]
+    prefix = terminal["file_prefix"]
     print(f"    Fetching {url}")
-    page, png_bytes = open_page(url, browser)
+    page, png_bytes, resp = open_page(url, browser)
     try:
-        table_data = page.evaluate("""
+        page_data = page.evaluate("""
         () => {
             const table = document.querySelector('table');
-            if (!table) return [];
-            return Array.from(table.querySelectorAll('tr')).map(tr =>
-                Array.from(tr.querySelectorAll('th, td')).map(cell => {
-                    const img = cell.querySelector('img');
-                    return img
-                        ? (img.getAttribute('title') || img.getAttribute('alt') || '')
-                        : cell.innerText.trim();
-                })
-            );
+            const rows = table
+                ? Array.from(table.querySelectorAll('tr')).map(tr =>
+                    Array.from(tr.querySelectorAll('th, td')).map(cell => {
+                        const img = cell.querySelector('img');
+                        return img
+                            ? (img.getAttribute('title') || img.getAttribute('alt') || '')
+                            : cell.innerText.trim();
+                    })
+                  )
+                : [];
+            return {
+                hasTable: !!table,
+                rows: rows,
+                bodyText: (document.body ? document.body.innerText : ''),
+            };
         }
         """)
+        has_table = page_data["hasTable"]
+        table_data = page_data["rows"]
+        body_text = page_data["bodyText"]
+        # Gathered unconditionally (cheap) so they're ready to attach if the
+        # checks below determine this is a real technical failure.
+        status = resp.status if resp else None
+        status_text = resp.status_text if resp else None
+        title = page.title()
+        html = page.content()
     finally:
         page.close()
 
-    prefix = terminal["file_prefix"]
     screenshots = [(
         f"{prefix}_terminal_screenshot_{today_str}.png",
         png_bytes,
     )]
 
-    if not table_data:
-        # No <table> element at all — the page genuinely failed to render
-        # (down, blocked, redesigned). This is a real technical failure.
+    if not has_table:
+        if GCT_NO_DATA_RE.search(body_text):
+            # Legitimate zero-slots result: GCT explicitly reports no
+            # reservation data for this terminal right now. Exactly the
+            # condition we're scraping for — flows through as 0 rows.
+            print("    0 slots — GCT reports no reservation data available "
+                  "('reservationInfoXmlList: Empty 0' — terminal closed or "
+                  "fully booked for this window)")
+            return GCT_HEADERS, [], screenshots
+
+        # No table AND no recognized "no availability" banner either — the
+        # page rendered something we don't recognize at all (down, blocked,
+        # redesigned). That's a real technical failure.
+        _upload_gct_failure_diagnostics(
+            svc, folder_id, prefix, today_str, url,
+            status, status_text, title, html, png_bytes,
+        )
         raise RuntimeError(
-            "GCT table not found in page — page failed to load or its "
+            "GCT table not found in page, and no recognized 'no "
+            "availability' message either — page failed to load or its "
             "structure has changed (this is a parsing problem, not a "
             "zero-availability result)"
         )
 
     if len(table_data) < 2:
-        # Even the two header rows are missing/incomplete — the table that
-        # *is* there isn't the reservation table we know how to read. Still
-        # a technical failure, not "zero slots".
+        # A table is there, but even the two header rows are missing — this
+        # isn't the reservation table we know how to read. Technical
+        # failure, not "zero slots".
+        _upload_gct_failure_diagnostics(
+            svc, folder_id, prefix, today_str, url,
+            status, status_text, title, html, png_bytes,
+        )
         raise RuntimeError(
             f"GCT table found but malformed ({len(table_data)} row(s), "
-            "expected at least the 2 header rows) — likely a page-structure "
-            "change, not a zero-availability result"
+            "expected at least the 2 header rows) — page failed to load "
+            "or its structure has changed (this is a parsing problem, not "
+            "a zero-availability result)"
         )
 
     # Rows 0–1 are the double-labeled headers; data starts at row 2.
-    # If nothing follows the headers, that's a legitimate result: the
-    # terminal has zero open slots right now (fully booked) — exactly the
-    # condition we're scraping for, so it flows through as 0 rows rather
-    # than raising.
+    # If nothing follows the headers, that's also a legitimate zero-slots
+    # result (fully booked) — flows through as 0 rows rather than raising.
     data_rows = [row for row in table_data[2:] if any(cell.strip() for cell in row)]
 
     # Align each row to the known GCT_HEADERS length
@@ -314,7 +403,7 @@ def process_truckgate(terminal: dict, browser, today_str: str):
     tf  = terminal.get("terminals_filter", [])
     print(f"    Fetching {url}")
 
-    page, png_bytes = open_page(url, browser, extra_wait_ms=4000)
+    page, png_bytes, _resp = open_page(url, browser, extra_wait_ms=4000)
     try:
         date_text  = page.inner_text("span.titlebar span")
         date_match = re.search(r"(\d{2}\.\d{2}\.\d{4})", date_text)
@@ -397,7 +486,9 @@ def process_terminal(terminal: dict, browser, svc, folder_id: str, today_str: st
     if ttype == "tdf":
         headers, rows, screenshots = process_tdf(terminal, browser, today_str)
     elif ttype == "gct":
-        headers, rows, screenshots = process_gct(terminal, browser, today_str)
+        headers, rows, screenshots = process_gct(
+            terminal, browser, today_str, svc, folder_id
+        )
     elif ttype == "truckgate":
         headers, rows, screenshots = process_truckgate(terminal, browser, today_str)
     else:
