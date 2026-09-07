@@ -30,6 +30,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -285,109 +286,143 @@ def _upload_gct_failure_diagnostics(
         print(f"    (could not upload failure diagnostics: {diag_exc})")
 
 
-# When GCT has nothing to reserve (terminal closed / fully booked for the
-# window queried), it doesn't render the table at all — it renders a plain
-# status banner reading "result: reservationInfoXmlList: Empty 0:" instead.
-# That is GCT's own explicit "no availability" signal, confirmed against
-# https://globalterminals.com/terminal-operations/gate-schedule/ , so it must
-# be treated as a real zero-slots result, not a parsing failure.
-GCT_NO_DATA_RE = re.compile(r"reservationInfoXmlList\s*:\s*Empty\s*0", re.I)
+# When GCT has nothing to reserve, it doesn't render the table at all — it
+# renders a plain status banner: "result: reservationInfoXmlList: Empty
+# <code>[: <detail>]". Two very different codes have been observed under
+# this banner:
+#   - "Empty 0"           -> genuinely no reservation data for this window
+#                            (terminal closed / fully booked). A real
+#                            zero-slots result — confirmed against
+#                            https://globalterminals.com/terminal-operations/gate-schedule/
+#   - "Empty 6: Previous request from the user <x> is still active. Please
+#     wait and repeat request in a few seconds." -> GCT's own backend is
+#     telling us to retry; NOT a zero-availability result and NOT a broken
+#     page. Any other non-zero code is treated the same way: transient, so
+#     we retry rather than either failing immediately or misreporting it
+#     as "no slots".
+GCT_STATUS_RE = re.compile(
+    r"reservationInfoXmlList\s*:\s*Empty\s*(\d+)\s*:?\s*([^\r\n]*)", re.I
+)
+GCT_MAX_ATTEMPTS = 3
+GCT_RETRY_WAIT_S = 8  # GCT's own busy message asks us to wait "a few seconds"
 
 
 def process_gct(terminal: dict, browser, today_str: str, svc, folder_id: str):
     """Returns (headers, rows, screenshots_list)."""
     url = terminal["url"]
     prefix = terminal["file_prefix"]
-    print(f"    Fetching {url}")
-    page, png_bytes, resp = open_page(url, browser)
-    try:
-        page_data = page.evaluate("""
-        () => {
-            const table = document.querySelector('table');
-            const rows = table
-                ? Array.from(table.querySelectorAll('tr')).map(tr =>
-                    Array.from(tr.querySelectorAll('th, td')).map(cell => {
-                        const img = cell.querySelector('img');
-                        return img
-                            ? (img.getAttribute('title') || img.getAttribute('alt') || '')
-                            : cell.innerText.trim();
-                    })
-                  )
-                : [];
-            return {
-                hasTable: !!table,
-                rows: rows,
-                bodyText: (document.body ? document.body.innerText : ''),
-            };
-        }
-        """)
-        has_table = page_data["hasTable"]
-        table_data = page_data["rows"]
-        body_text = page_data["bodyText"]
-        # Gathered unconditionally (cheap) so they're ready to attach if the
-        # checks below determine this is a real technical failure.
-        status = resp.status if resp else None
-        status_text = resp.status_text if resp else None
-        title = page.title()
-        html = page.content()
-    finally:
-        page.close()
+    screenshots = None
+    diag = None       # (status, status_text, title, html, png_bytes) of the
+                       # most recent attempt, kept in case we ultimately fail
+    code = detail = None
 
-    screenshots = [(
-        f"{prefix}_terminal_screenshot_{today_str}.png",
-        png_bytes,
-    )]
+    for attempt in range(1, GCT_MAX_ATTEMPTS + 1):
+        suffix = f" (attempt {attempt}/{GCT_MAX_ATTEMPTS})" if attempt > 1 else ""
+        print(f"    Fetching {url}{suffix}")
+        page, png_bytes, resp = open_page(url, browser)
+        try:
+            page_data = page.evaluate("""
+            () => {
+                const table = document.querySelector('table');
+                const rows = table
+                    ? Array.from(table.querySelectorAll('tr')).map(tr =>
+                        Array.from(tr.querySelectorAll('th, td')).map(cell => {
+                            const img = cell.querySelector('img');
+                            return img
+                                ? (img.getAttribute('title') || img.getAttribute('alt') || '')
+                                : cell.innerText.trim();
+                        })
+                      )
+                    : [];
+                return {
+                    hasTable: !!table,
+                    rows: rows,
+                    bodyText: (document.body ? document.body.innerText : ''),
+                };
+            }
+            """)
+            has_table = page_data["hasTable"]
+            table_data = page_data["rows"]
+            body_text = page_data["bodyText"]
+            # Gathered unconditionally (cheap) so they're ready to attach if
+            # we ultimately give up and need to report a real failure.
+            status = resp.status if resp else None
+            status_text = resp.status_text if resp else None
+            title = page.title()
+            html = page.content()
+        finally:
+            page.close()
 
-    if not has_table:
-        if GCT_NO_DATA_RE.search(body_text):
-            # Legitimate zero-slots result: GCT explicitly reports no
-            # reservation data for this terminal right now. Exactly the
-            # condition we're scraping for — flows through as 0 rows.
+        screenshots = [(
+            f"{prefix}_terminal_screenshot_{today_str}.png",
+            png_bytes,
+        )]
+        diag = (status, status_text, title, html, png_bytes)
+
+        if has_table:
+            if len(table_data) >= 2:
+                # Rows 0–1 are the double-labeled headers; data starts at
+                # row 2. Nothing after the headers is also a legitimate
+                # zero-slots result (fully booked) — flows through as 0
+                # rows rather than raising.
+                data_rows = [
+                    row for row in table_data[2:] if any(cell.strip() for cell in row)
+                ]
+                n = len(GCT_HEADERS)
+                rows = [row[:n] + [""] * max(0, n - len(row)) for row in data_rows]
+                print(f"    {len(rows)} time slots parsed")
+                return GCT_HEADERS, rows, screenshots
+
+            # A table is there, but even the two header rows are missing —
+            # this isn't the reservation table we know how to read, and
+            # we've no evidence this is transient, so fail immediately
+            # rather than burn retry budget on it.
+            _upload_gct_failure_diagnostics(svc, folder_id, prefix, today_str, url, *diag)
+            raise RuntimeError(
+                f"GCT table found but malformed ({len(table_data)} row(s), "
+                "expected at least the 2 header rows) — page failed to "
+                "load or its structure has changed (this is a parsing "
+                "problem, not a zero-availability result)"
+            )
+
+        m = GCT_STATUS_RE.search(body_text)
+        if not m:
+            # No table AND no recognized status banner either — the page
+            # rendered something we don't recognize at all (down, blocked,
+            # redesigned). Real technical failure.
+            _upload_gct_failure_diagnostics(svc, folder_id, prefix, today_str, url, *diag)
+            raise RuntimeError(
+                "GCT table not found in page, and no recognized "
+                "'reservationInfoXmlList' status message either — page "
+                "failed to load or its structure has changed (this is a "
+                "parsing problem, not a zero-availability result)"
+            )
+
+        code, detail = m.group(1), m.group(2).strip()
+        if code == "0":
             print("    0 slots — GCT reports no reservation data available "
                   "('reservationInfoXmlList: Empty 0' — terminal closed or "
                   "fully booked for this window)")
             return GCT_HEADERS, [], screenshots
 
-        # No table AND no recognized "no availability" banner either — the
-        # page rendered something we don't recognize at all (down, blocked,
-        # redesigned). That's a real technical failure.
-        _upload_gct_failure_diagnostics(
-            svc, folder_id, prefix, today_str, url,
-            status, status_text, title, html, png_bytes,
-        )
-        raise RuntimeError(
-            "GCT table not found in page, and no recognized 'no "
-            "availability' message either — page failed to load or its "
-            "structure has changed (this is a parsing problem, not a "
-            "zero-availability result)"
-        )
+        # Any other code is GCT telling us something transient happened on
+        # its side (observed: code 6, "Previous request from the user ...
+        # is still active. Please wait and repeat request in a few
+        # seconds."). Retry rather than treating it as broken or empty.
+        print(f"    GCT busy (code {code}): {detail or '(no detail)'}")
+        if attempt < GCT_MAX_ATTEMPTS:
+            print(f"    Waiting {GCT_RETRY_WAIT_S}s before retrying "
+                  "(GCT asked us to)...")
+            time.sleep(GCT_RETRY_WAIT_S)
 
-    if len(table_data) < 2:
-        # A table is there, but even the two header rows are missing — this
-        # isn't the reservation table we know how to read. Technical
-        # failure, not "zero slots".
-        _upload_gct_failure_diagnostics(
-            svc, folder_id, prefix, today_str, url,
-            status, status_text, title, html, png_bytes,
-        )
-        raise RuntimeError(
-            f"GCT table found but malformed ({len(table_data)} row(s), "
-            "expected at least the 2 header rows) — page failed to load "
-            "or its structure has changed (this is a parsing problem, not "
-            "a zero-availability result)"
-        )
-
-    # Rows 0–1 are the double-labeled headers; data starts at row 2.
-    # If nothing follows the headers, that's also a legitimate zero-slots
-    # result (fully booked) — flows through as 0 rows rather than raising.
-    data_rows = [row for row in table_data[2:] if any(cell.strip() for cell in row)]
-
-    # Align each row to the known GCT_HEADERS length
-    n = len(GCT_HEADERS)
-    rows = [row[:n] + [""] * max(0, n - len(row)) for row in data_rows]
-
-    print(f"    {len(rows)} time slots parsed")
-    return GCT_HEADERS, rows, screenshots
+    # GCT kept reporting itself busy on every attempt.
+    _upload_gct_failure_diagnostics(svc, folder_id, prefix, today_str, url, *diag)
+    raise RuntimeError(
+        f"GCT backend reported itself busy on all {GCT_MAX_ATTEMPTS} "
+        f"attempts (reservationInfoXmlList: Empty {code}: {detail}) — this "
+        "is GCT's own 'still processing, please retry' response, not a "
+        "zero-availability result"
+    )
 
 
 # ---------------------------------------------------------------------------
