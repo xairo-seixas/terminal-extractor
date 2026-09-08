@@ -97,12 +97,20 @@ TERMINALS = [
 # crossbilling signal), so it must never be suppressed or turned into a
 # failure.
 
-# Known GCT column order (server-rendered JSP, stable format)
+# Fallback header row used ONLY for the genuine-zero-availability case
+# (GCT's "reservationInfoXmlList: Empty 0" banner, where no table is
+# rendered at all, so there's no live table to read column names from).
+# When a table IS rendered, headers are read from it directly instead —
+# see process_gct() — because GCT has changed this column set before
+# (silently dropped "IW"/"IZ") without any other visible sign of
+# breakage, so a hardcoded list used for real parsing would just
+# mislabel columns rather than error out. Kept roughly in sync with the
+# live site as of 2026-09-08 for this fallback's own sake.
 GCT_HEADERS = [
     "Date", "Period",
     "Empty In", "Empty Out", "Full In", "Full Out", "Reefer In",
     "AE", "AW", "BE", "BW", "CE", "CW", "DE", "DW",
-    "EW", "FW", "IT", "IW", "IZ", "JT", "JZ",
+    "EW", "FW", "IT", "JT", "JZ",
     "KT", "KZ", "LE", "LZ", "MW", "NW",
 ]
 
@@ -319,7 +327,26 @@ def process_gct(terminal: dict, browser, today_str: str, svc, folder_id: str):
     for attempt in range(1, GCT_MAX_ATTEMPTS + 1):
         suffix = f" (attempt {attempt}/{GCT_MAX_ATTEMPTS})" if attempt > 1 else ""
         print(f"    Fetching {url}{suffix}")
-        page, png_bytes, resp = open_page(url, browser)
+
+        try:
+            page, png_bytes, resp = open_page(url, browser)
+        except Exception as nav_exc:
+            # A hard navigation failure (e.g. Playwright's own goto timeout)
+            # is just as likely to be transient as GCT's "busy" banner below,
+            # so it gets the same retry budget instead of failing the
+            # terminal on the very first attempt. There's no page/HTML to
+            # attach as diagnostics here since navigation itself never
+            # completed.
+            print(f"    Navigation failed: {nav_exc}")
+            if attempt < GCT_MAX_ATTEMPTS:
+                print(f"    Waiting {GCT_RETRY_WAIT_S}s before retrying...")
+                time.sleep(GCT_RETRY_WAIT_S)
+                continue
+            raise RuntimeError(
+                f"GCT page navigation failed on all {GCT_MAX_ATTEMPTS} "
+                f"attempts: {nav_exc}"
+            ) from nav_exc
+
         try:
             page_data = page.evaluate("""
             () => {
@@ -361,28 +388,34 @@ def process_gct(terminal: dict, browser, today_str: str, svc, folder_id: str):
 
         if has_table:
             if len(table_data) >= 2:
-                # Rows 0–1 are the double-labeled headers; data starts at
-                # row 2. Nothing after the headers is also a legitimate
+                # Row 0 is the single header row (column labels); data
+                # starts at row 1. Headers are read from the page itself
+                # rather than a hardcoded list -- GCT has changed its
+                # column set before (silently dropped "IW"/"IZ") with no
+                # other visible sign of breakage, so a static list here
+                # would just mislabel columns rather than error out.
+                # Nothing after the header is also a legitimate
                 # zero-slots result (fully booked) — flows through as 0
                 # rows rather than raising.
+                headers = table_data[0]
                 data_rows = [
-                    row for row in table_data[2:] if any(cell.strip() for cell in row)
+                    row for row in table_data[1:] if any(cell.strip() for cell in row)
                 ]
-                n = len(GCT_HEADERS)
+                n = len(headers)
                 rows = [row[:n] + [""] * max(0, n - len(row)) for row in data_rows]
-                print(f"    {len(rows)} time slots parsed")
-                return GCT_HEADERS, rows, screenshots
+                print(f"    {len(rows)} time slots parsed across {n} columns")
+                return headers, rows, screenshots
 
-            # A table is there, but even the two header rows are missing —
-            # this isn't the reservation table we know how to read, and
-            # we've no evidence this is transient, so fail immediately
+            # A table is there, but not even a header row plus one data
+            # row — this isn't the reservation table we know how to read,
+            # and we've no evidence this is transient, so fail immediately
             # rather than burn retry budget on it.
             _upload_gct_failure_diagnostics(svc, folder_id, prefix, today_str, url, *diag)
             raise RuntimeError(
-                f"GCT table found but malformed ({len(table_data)} row(s), "
-                "expected at least the 2 header rows) — page failed to "
-                "load or its structure has changed (this is a parsing "
-                "problem, not a zero-availability result)"
+                f"GCT table found but empty/malformed ({len(table_data)} "
+                "row(s), expected at least a header row plus one data "
+                "row) — page failed to load or its structure has changed "
+                "(this is a parsing problem, not a zero-availability result)"
             )
 
         m = GCT_STATUS_RE.search(body_text)
